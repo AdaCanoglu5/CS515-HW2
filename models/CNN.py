@@ -4,7 +4,7 @@ import torch.nn.functional as F
 
 class MNIST_CNN(nn.Module):
 
-    def __init__(self,norm,num_classes=10):
+    def __init__(self, norm=None, num_classes=10):
         super(MNIST_CNN, self).__init__() 
         self.conv1 = nn.Conv2d(1, 20, 5, 1) #format: (in_channels, out_channels, kernel_size, stride)
         self.conv2 = nn.Conv2d(20, 50, 5, 1) 

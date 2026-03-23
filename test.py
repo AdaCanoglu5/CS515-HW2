@@ -1,40 +1,84 @@
-import torch
-from torch.utils.data import DataLoader
-from torchvision import datasets, transforms
+"""Evaluation utilities for the compact CIFAR/MNIST training pipeline."""
 
-from train import get_transforms
+from __future__ import annotations
+
+from typing import Any
+
+import torch
+import torch.nn as nn
+
+from parameters import ExperimentConfig
+from train import append_run_row, build_log_row, get_loaders, get_teacher_run_name, get_train_mode, upsert_summary_row
 
 
 @torch.no_grad()
-def run_test(model, params, device):
-    tf = get_transforms(params, train=False)
+def run_test(
+    model: torch.nn.Module,
+    params: ExperimentConfig,
+    device: torch.device,
+    train_summary: dict[str, Any] | None = None,
+) -> dict[str, float]:
+    """Load the best checkpoint, evaluate on the held-out test set, and update logs."""
 
-    if params["dataset"] == "mnist":
-        test_ds = datasets.MNIST(params["data_dir"], train=False, download=True, transform=tf)
-    else:  # cifar10
-        test_ds = datasets.CIFAR10(params["data_dir"], train=False, download=True, transform=tf)
+    _, _, test_loader = get_loaders(params)
+    state_dict = torch.load(params["save_path"], map_location=device)
+    if isinstance(state_dict, dict) and "model_state_dict" in state_dict:
+        state_dict = state_dict["model_state_dict"]
 
-    loader = DataLoader(test_ds, batch_size=params["batch_size"],
-                        shuffle=False, num_workers=params["num_workers"])
-
-    model.load_state_dict(torch.load(params["save_path"], map_location=device))
+    model.load_state_dict(state_dict)
     model.eval()
 
-    correct, n = 0, 0
-    class_correct = [0] * params["num_classes"]
-    class_total   = [0] * params["num_classes"]
+    criterion = nn.CrossEntropyLoss()
+    total_loss, correct, total = 0.0, 0, 0
 
-    for imgs, labels in loader:
+    for imgs, labels in test_loader:
         imgs, labels = imgs.to(device), labels.to(device)
-        preds = model(imgs).argmax(1)
-        correct += preds.eq(labels).sum().item()
-        n       += imgs.size(0)
-        for p, t in zip(preds, labels):
-            class_correct[t] += (p == t).item()
-            class_total[t]   += 1
+        logits = model(imgs)
+        loss = criterion(logits, labels)
+        total_loss += loss.detach().item() * imgs.size(0)
+        correct += logits.argmax(1).eq(labels).sum().item()
+        total += imgs.size(0)
 
-    print(f"\n=== Test Results ===")
-    print(f"Overall accuracy: {correct/n:.4f}  ({correct}/{n})\n")
-    for i in range(params["num_classes"]):
-        acc = class_correct[i] / class_total[i]
-        print(f"  Class {i}: {acc:.4f}  ({class_correct[i]}/{class_total[i]})")
+    test_loss = total_loss / total
+    test_accuracy = correct / total
+    append_run_row(
+        params,
+        build_log_row(
+            params=params,
+            epoch=params["epochs"],
+            split="test",
+            loss=test_loss,
+            accuracy=test_accuracy,
+            lr=0.0,
+        ),
+    )
+
+    summary = train_summary or {}
+    upsert_summary_row(
+        params,
+        {
+            "run_name": params["run_name"],
+            "model": params["model"],
+            "dataset": params["dataset"],
+            "train_mode": get_train_mode(params),
+            "teacher_run": get_teacher_run_name(params),
+            "checkpoint_path": params["save_path"],
+            "label_smoothing": params["label_smoothing"],
+            "temperature": params["temperature"] if params["distill_mode"] == "kd" else (1.0 if params["distill_mode"] == "teacher_trueclass_prob" else ""),
+            "alpha": params["alpha"] if params["distill_mode"] == "kd" else "",
+            "input_size": params["input_size"],
+            "best_epoch": summary.get("best_epoch", ""),
+            "best_val_loss": summary.get("best_val_loss", ""),
+            "best_val_accuracy": summary.get("best_val_accuracy", ""),
+            "final_train_loss": summary.get("final_train_loss", ""),
+            "final_train_accuracy": summary.get("final_train_accuracy", ""),
+            "final_val_loss": summary.get("final_val_loss", ""),
+            "final_val_accuracy": summary.get("final_val_accuracy", ""),
+            "test_loss": f"{test_loss:.6f}",
+            "test_accuracy": f"{test_accuracy:.6f}",
+            "seed": params["seed"],
+        },
+    )
+
+    print(f"Test | loss={test_loss:.4f} acc={test_accuracy:.4f}")
+    return {"test_loss": test_loss, "test_accuracy": test_accuracy}
